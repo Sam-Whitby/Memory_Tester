@@ -79,30 +79,56 @@ groups of note-onsets that fall within a configurable time window ε (default
 numbers. Two recordings are then compared as sequences of these events using
 Smith-Waterman local alignment.
 
-### Scoring function
+### Chord similarity
 
-Each pair of chord events is scored by **Jaccard similarity** on their pitch sets:
+Each pair of chord events is compared using **octave-aware soft Jaccard similarity**.
+For every pair of notes across the two chords a pitch similarity is computed:
 
 ```
-Jaccard(A, B) = |A ∩ B| / |A ∪ B|
-match_score(A, B) = 2 · Jaccard(A, B) − 1
+pitch_sim(p, q) = 1.0   if p == q            (exact match)
+                  0.9   if p % 12 == q % 12  (same pitch class, different octave)
+                  0.0   otherwise
 ```
 
-This maps the interval [0, 1] to [−1, +1]:
-- Identical chords → +1.0 (strongly reinforces alignment)
-- 50 % pitch overlap → 0.0 (neutral)
-- No shared pitches → −1.0 (opening a gap is preferred)
+The maximum-weight bipartite matching over all note pairs is found, then
+normalised by the larger chord size:
 
-The SW recurrence is the standard local-alignment DP:
+```
+chord_sim(A, B) = max_matching(sim_matrix) / max(|A|, |B|)
+```
+
+This gives a value in [0, 1] with partial credit for chords that share pitch
+classes but differ in octave, and a penalty for extra or missing notes.
+
+The SW match score maps chord similarity to [−1, +1]:
+
+```
+match_score(A, B) = 2 · chord_sim(A, B) − 1
+```
+
+- Identical chords → +1.0
+- All notes in the correct pitch class but wrong octave → +0.8
+- 50 % soft chord overlap → 0.0 (neutral)
+- No pitch-class overlap → −1.0 (opening a gap is preferred)
+
+### Duration-weighted gap penalties
+
+Each chord event is assigned a **weight** proportional to its duration:
+
+```
+weight(event) = max(WEIGHT_FLOOR, duration(event) / median_duration)
+gap_cost(event) = gap_penalty × weight(event)
+```
+
+Long structural notes are expensive to skip; short grace notes are cheap.
+The SW recurrence becomes:
 
 ```
 H(i, j) = max(0,
-              H(i-1, j-1) + match_score(A_i, B_j),   # match / mismatch
-              H(i-1, j)   − gap_penalty,               # gap in B
-              H(i,   j-1) − gap_penalty)               # gap in A
+              H(i-1, j-1) + match_score(A_i, B_j),
+              H(i-1, j)   − gap_penalty × weight(A_i),
+              H(i,   j-1) − gap_penalty × weight(B_j))
 ```
-
-(default gap penalty = 0.5)
 
 ### Normalisation
 
@@ -116,6 +142,38 @@ sim(A, B) = SW(A, B) / √(SW(A, A) · SW(B, B))
 Identical sequences score 1.0; completely disjoint sequences score 0.0.
 This is equivalent to cosine normalisation in the SW score space and is the
 same approach used by normalised sequence identity in bioinformatics.
+
+---
+
+## Comparison with parangonar
+
+[parangonar](https://github.com/CPJKU/parangonar) is a state-of-the-art MIDI
+**score-to-performance** alignment tool (Nakamura et al. 2015, Foscarin et al.
+2020). The two systems solve related but distinct problems:
+
+| Dimension | This tool | parangonar |
+|-----------|-----------|------------|
+| **Task** | Compare two *performances* of the same improvisation | Align a *performance* to a notated *score* |
+| **Algorithm** | Smith-Waterman local sequence alignment | HMM or DTW over note-event sequences |
+| **Pitch matching** | Octave-aware (same pitch class = 0.9 credit) | Exact MIDI pitch match |
+| **Gap / deletion cost** | Scales with note duration (`weight = dur / median`) | Deletion probability scales with note duration (Nakamura 2015) |
+| **Polyphony** | Chord-event grouping (ε window) + bipartite matching | Note-by-note matching with instrument track separation |
+| **Rhythm** | Duration used only for gap weighting; timing not scored | Full onset-time alignment is the primary output |
+| **Output** | Single similarity score in [0, 1] | Correspondence table: which score note maps to which performed note |
+
+**Shared inspiration**: the duration-weighted gap penalty used here is directly
+inspired by parangonar's core insight — that deleting a long note is a more
+significant alignment event than deleting a short grace note, and the model
+should reflect this. Both approaches scale the cost of skipping a note by its
+duration relative to surrounding notes.
+
+**Key divergence**: parangonar is designed for score-to-performance alignment,
+where a ground-truth note sequence exists and the goal is precise correspondence.
+This tool is designed for *performance-to-performance* comparison with no ground
+truth, so a single normalised similarity score is more informative than a note
+correspondence table. SW local alignment is preferred over global DTW because it
+gives partial credit for a correctly recalled passage even when the performer
+blanks on the opening or ending.
 
 ---
 
@@ -165,30 +223,33 @@ python align.py --epsilon 50
 
 # Custom directory
 python align.py path/to/midi/dir --epsilon 30 --gap 0.4
+
+# Reduce octave similarity credit (penalise wrong-octave notes more)
+python align.py --octave-weight 0.5
 ```
 
 ### Example output
 
 ```
-ε = 30.0 ms  |  gap penalty = 0.5
+ε = 30.0 ms  |  gap penalty = 0.5  |  octave weight = 0.9
 Loading 10 files from 'examples/'
 
   ex01_A_clean.mid                        28 events
   ex02_A_del3.mid                         25 events
   ...
 
-Pairwise similarity (SW / Jaccard pitch, cosine-normalised):
+Pairwise similarity (SW / soft chord sim, cosine-normalised):
 
                ex01  ex02  ex03  ex04  ex05  ex06  ex07  ex08  ex09  ex10
 ─────────────────────────────────────────────────────────────────────────
-ex01_A_clean  1.000 0.888 0.750 0.741 0.491 0.435 0.071 0.073 0.037 0.000
-ex02_A_del3   0.888 1.000 0.624 0.608 0.423 0.360 0.076 0.077 0.039 0.000
-ex03_A_sub4   0.750 0.624 1.000 0.482 0.309 0.283 0.089 0.091 0.037 0.038
-ex04_A_mixed  0.741 0.608 0.482 1.000 0.434 0.431 0.074 0.075 0.038 0.000
-ex05_B_clean  0.491 0.423 0.309 0.434 1.000 0.847 0.091 0.111 0.038 0.000
-ex06_B_var    0.435 0.360 0.283 0.431 0.847 1.000 0.076 0.096 0.039 0.000
-ex07_C_clean  0.071 0.076 0.089 0.074 0.091 0.076 1.000 0.818 0.037 0.038
-ex08_C_var    0.073 0.077 0.091 0.075 0.111 0.096 0.818 1.000 0.038 0.038
+ex01_A_clean  1.000 0.907 0.762 0.757 0.509 0.454 0.071 0.073 0.037 0.000
+ex02_A_del3   0.907 1.000 0.658 0.667 0.462 0.400 0.076 0.077 0.039 0.000
+ex03_A_sub4   0.762 0.658 1.000 0.513 0.297 0.290 0.089 0.091 0.037 0.038
+ex04_A_mixed  0.757 0.667 0.513 1.000 0.462 0.402 0.074 0.075 0.038 0.000
+ex05_B_clean  0.509 0.462 0.297 0.462 1.000 0.828 0.091 0.074 0.038 0.000
+ex06_B_var    0.454 0.400 0.290 0.402 0.828 1.000 0.076 0.077 0.039 0.000
+ex07_C_clean  0.071 0.076 0.089 0.074 0.091 0.076 1.000 0.764 0.037 0.038
+ex08_C_var    0.073 0.077 0.091 0.075 0.074 0.077 0.764 1.000 0.038 0.038
 ex09_D_clean  0.037 0.039 0.037 0.038 0.038 0.039 0.037 0.038 1.000 0.804
 ex10_D_var    0.000 0.000 0.038 0.000 0.000 0.000 0.038 0.038 0.804 1.000
 ```

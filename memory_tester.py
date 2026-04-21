@@ -27,45 +27,100 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # ── Smith-Waterman alignment (inline — no dependency on align.py at runtime) ───
 
-EPSILON_MS  = 30.0
-GAP_PENALTY = 0.5
+EPSILON_MS   = 30.0
+GAP_PENALTY  = 0.5
+OCTAVE_WEIGHT = 0.9   # credit for correct pitch class in the wrong octave
+WEIGHT_FLOOR  = 0.05  # minimum event weight (prevents grace notes being free to skip)
 
 
-def _jaccard(a: frozenset, b: frozenset) -> float:
-    if not a and not b:
+# ── pitch similarity ───────────────────────────────────────────────────────────
+
+def _pitch_sim(p: int, q: int) -> float:
+    """
+    Similarity between two MIDI note numbers.
+      1.0  exact match
+      0.9  same pitch class, different octave  (e.g. C4 vs C5)
+      0.0  different pitch class
+    """
+    if p == q:
         return 1.0
-    return len(a & b) / len(a | b)
+    if p % 12 == q % 12:
+        return OCTAVE_WEIGHT
+    return 0.0
 
 
-def _sw_raw(seq_a, seq_b) -> float:
-    """Raw Smith-Waterman score using Jaccard pitch similarity."""
-    n, m = len(seq_a), len(seq_b)
+def _max_assignment(sim_mat: np.ndarray) -> float:
+    """
+    Maximum-weight bipartite matching for a small similarity matrix.
+    Uses brute-force permutation enumeration — fast for chord sizes ≤ 5.
+    Falls back to scipy.optimize.linear_sum_assignment for larger inputs.
+    """
+    n, m = sim_mat.shape
     if n == 0 or m == 0:
         return 0.0
-    H = np.zeros((n + 1, m + 1))
-    for i in range(1, n + 1):
-        pi = seq_a[i - 1]["pitches"]
-        for j in range(1, m + 1):
-            s = 2.0 * _jaccard(pi, seq_b[j - 1]["pitches"]) - 1.0
-            H[i, j] = max(0.0,
-                          H[i - 1, j - 1] + s,
-                          H[i - 1, j    ] - GAP_PENALTY,
-                          H[i,     j - 1] - GAP_PENALTY)
-    return float(H.max())
+    if n == 1:
+        return float(sim_mat.max())
+    if m == 1:
+        return float(sim_mat.max())
+    if max(n, m) <= 5:
+        from itertools import permutations
+        k, big = min(n, m), max(n, m)
+        best = 0.0
+        for perm in permutations(range(big), k):
+            if n <= m:
+                t = sum(sim_mat[i, perm[i]] for i in range(k))
+            else:
+                t = sum(sim_mat[perm[j], j] for j in range(k))
+            if t > best:
+                best = t
+        return best
+    # scipy path for unusual large chords
+    from scipy.optimize import linear_sum_assignment
+    r, c = linear_sum_assignment(-sim_mat)
+    return float(sim_mat[r, c].sum())
 
 
-def _similarity(seq_a, seq_b) -> float:
-    """Cosine-normalised SW similarity in [0, 1]."""
-    s_ab = _sw_raw(seq_a, seq_b)
-    denom = (_sw_raw(seq_a, seq_a) * _sw_raw(seq_b, seq_b)) ** 0.5
-    return min(1.0, s_ab / denom) if denom > 0.0 else 0.0
+def _chord_sim(pitches_a: frozenset, pitches_b: frozenset) -> float:
+    """
+    Soft chord similarity in [0, 1].
 
+    Builds a pitch-similarity matrix over all pairs, finds the optimal
+    note-to-note assignment (maximum bipartite matching), then normalises
+    by the larger chord size so that missing/extra notes are penalised.
+
+      identical chords          → 1.0
+      all notes right, wrong octave → OCTAVE_WEIGHT (≈ 0.9)
+      completely different chords   → 0.0
+    """
+    a, b = list(pitches_a), list(pitches_b)
+    na, nb = len(a), len(b)
+    if na == 0 and nb == 0:
+        return 1.0
+    if na == 0 or nb == 0:
+        return 0.0
+    sim_mat = np.array([[_pitch_sim(p, q) for q in b] for p in a],
+                       dtype=np.float64)
+    matched = _max_assignment(sim_mat)
+    return matched / max(na, nb)
+
+
+# ── event extraction ───────────────────────────────────────────────────────────
 
 def _to_events(raw_notes, epsilon_ms=EPSILON_MS):
-    """[(onset_ms, pitch), …] → ordered chord-event list."""
+    """
+    [(onset_ms, pitch), …] → ordered chord-event list.
+
+    Each event dict carries:
+      pitches     : frozenset of MIDI note numbers
+      onset_ms    : absolute onset of the first note in the group
+      duration_ms : inter-onset interval to the next event (IOI proxy for duration)
+      weight      : duration_ms / median(duration_ms across all events), floored
+                    at WEIGHT_FLOOR so grace notes are cheap but not free to skip
+    """
     if not raw_notes:
         return []
     raw = sorted(raw_notes, key=lambda x: x[0])
+
     events, i = [], 0
     while i < len(raw):
         anchor = raw[i][0]
@@ -76,7 +131,61 @@ def _to_events(raw_notes, epsilon_ms=EPSILON_MS):
             j += 1
         events.append({"pitches": frozenset(pitches), "onset_ms": anchor})
         i = j
+
+    # IOI-based duration: time from this event to the next
+    n = len(events)
+    iois = [events[k + 1]["onset_ms"] - events[k]["onset_ms"]
+            for k in range(n - 1)]
+    median_ioi = float(np.median(iois)) if iois else 500.0
+    for k, ev in enumerate(events):
+        ev["duration_ms"] = iois[k] if k < len(iois) else median_ioi
+
+    # Normalise to weights (median event → weight 1.0)
+    median_dur = float(np.median([e["duration_ms"] for e in events]))
+    for ev in events:
+        ev["weight"] = max(WEIGHT_FLOOR,
+                           ev["duration_ms"] / median_dur if median_dur > 0 else 1.0)
     return events
+
+
+# ── Smith-Waterman core ────────────────────────────────────────────────────────
+
+def _sw_raw(seq_a, seq_b) -> float:
+    """
+    Raw SW local alignment score.
+
+    Match score:  2 * chord_sim(A_i, B_j) - 1
+      Identical chords     → +1.0
+      All notes in right PC but wrong octave → +0.8  (≈ 2*0.9 - 1)
+      Completely different → −1.0  (SW resets to 0; opening a gap is preferred)
+
+    Gap penalty: base GAP_PENALTY scaled by the event's duration weight.
+      H[i-1,j] - gap(A_i)  skipping event A_i (long note → expensive to omit)
+      H[i,j-1] - gap(B_j)  skipping event B_j (grace note → cheap to omit)
+    """
+    n, m = len(seq_a), len(seq_b)
+    if n == 0 or m == 0:
+        return 0.0
+    H = np.zeros((n + 1, m + 1))
+    for i in range(1, n + 1):
+        a_i = seq_a[i - 1]
+        for j in range(1, m + 1):
+            b_j   = seq_b[j - 1]
+            s     = 2.0 * _chord_sim(a_i["pitches"], b_j["pitches"]) - 1.0
+            gap_a = GAP_PENALTY * a_i.get("weight", 1.0)
+            gap_b = GAP_PENALTY * b_j.get("weight", 1.0)
+            H[i, j] = max(0.0,
+                          H[i - 1, j - 1] + s,
+                          H[i - 1, j    ] - gap_a,
+                          H[i,     j - 1] - gap_b)
+    return float(H.max())
+
+
+def _similarity(seq_a, seq_b) -> float:
+    """Cosine-normalised SW similarity in [0, 1]."""
+    s_ab = _sw_raw(seq_a, seq_b)
+    denom = (_sw_raw(seq_a, seq_a) * _sw_raw(seq_b, seq_b)) ** 0.5
+    return min(1.0, s_ab / denom) if denom > 0.0 else 0.0
 
 
 # ── MIDI listener (background thread) ─────────────────────────────────────────
