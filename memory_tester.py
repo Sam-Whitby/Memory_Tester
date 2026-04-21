@@ -261,7 +261,8 @@ class App(tk.Tk):
                        linestyle=":", alpha=0.5)
 
         self._fig.tight_layout(pad=1.4)
-        self._canvas.draw()
+        if hasattr(self, "_canvas"):
+            self._canvas.draw()
 
     # ─────────────────────────────────────────────────────────────────────────
     # MIDI connection
