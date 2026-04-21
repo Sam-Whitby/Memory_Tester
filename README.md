@@ -1,12 +1,73 @@
-# Memory Tester — MIDI Smith-Waterman Alignment (Proof of Concept)
+# Memory Tester — MIDI Improvisation Recall Trainer
 
-A proof-of-concept for comparing MIDI recordings of piano improvisation using
-**Smith-Waterman local sequence alignment** on chord-event representations.
+An ear-training tool for piano improvisers. Play a melody on a connected MIDI
+keyboard, then try to reconstruct it from memory as many times as you like.
+Each attempt is scored against the original using **Smith-Waterman local
+sequence alignment** on chord-event representations. Results are shown in a
+live table and graph.
 
-The intended application is an improvisation-recall trainer: a musician plays a
-melody, tries to reproduce it from memory, and the system scores how well the
-reconstruction matched the original. This repo demonstrates the core comparison
-engine in isolation.
+---
+
+## Quick start
+
+Connect a MIDI keyboard, then **double-click `Memory Tester.command`** in
+Finder. Terminal opens, the app launches, and the GUI appears.
+
+Or from a terminal:
+
+```bash
+python3 memory_tester.py
+```
+
+### Workflow
+
+| Step | Action |
+|------|--------|
+| 1 | App connects to your MIDI keyboard automatically |
+| 2 | Play your improvisation — recording starts on the **first note** |
+| 3 | Press **Space** to stop the original recording |
+| 4 | Attempt to reconstruct it from memory — recording starts on first note |
+| 5 | Press **Space** to stop; score is added to the table and graph |
+| 6 | Repeat step 4–5 as many times as you like |
+| 7 | Press **Space twice** (no notes between the two presses) to end the session |
+
+During recording phases **no pitch or note information is shown** — only a
+colour pulse confirms that notes are being captured.  Recordings are held in
+memory only and are discarded when the window closes.
+
+---
+
+## Repository structure
+
+```
+Memory_Tester/
+├── Memory Tester.command  # Double-click launcher (macOS)
+├── memory_tester.py       # GUI application
+├── align.py               # Batch pairwise similarity matrix (CLI tool)
+├── generate_examples.py   # Generates 10 example MIDI files
+├── requirements.txt
+└── examples/              # Generated .mid files
+```
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+Requires Python ≥ 3.8 with tkinter (Anaconda distributions include this).
+On macOS the `Memory Tester.command` launcher auto-installs dependencies.
+
+---
+
+## Batch alignment tool (CLI)
+
+To compute a pairwise similarity matrix over a directory of MIDI files:
+
+```bash
+python align.py                    # default: examples/, ε = 30 ms
+python align.py --epsilon 50       # custom chord-grouping window
+```
 
 ---
 
